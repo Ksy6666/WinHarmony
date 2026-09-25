@@ -1,0 +1,18 @@
+0 verbose cli D:\nvc_action\nodejs\node.exe D:\nvc_action\nodejs\node_modules\npm\bin\npm-cli.js
+1 info using npm@11.6.2
+2 info using node@v24.13.0
+3 silly config load:file:D:\nvm\v24.13.0\node_modules\npm\npmrc
+4 silly config load:file:C:\Users\Ksy\.npmrc
+5 silly config load:file:D:\nodejs\node_global\etc\npmrc
+6 verbose title npm list
+7 verbose argv "list" "--global" "--depth" "0"
+8 verbose logfile logs-max:10 dir:D:\opencode_W\远程连接\nodejs\node_cache\_logs\2026-09-21T03_19_07_814Z-
+9 verbose logfile D:\opencode_W\远程连接\nodejs\node_cache\_logs\2026-09-21T03_19_07_814Z-debug-0.log
+10 silly packumentCache heap:4496293888 maxSize:1124073472 maxEntrySize:562036736
+11 silly logfile done cleaning log files
+12 verbose cwd D:\opencode_W\远程连接
+13 verbose os Windows_NT 10.0.26100
+14 verbose node v24.13.0
+15 verbose npm  v11.6.2
+16 verbose exit 0
+17 info ok
