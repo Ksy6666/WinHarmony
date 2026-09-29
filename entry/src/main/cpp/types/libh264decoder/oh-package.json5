@@ -1,0 +1,6 @@
+{
+  "name": "libh264decoder.so",
+  "types": "./index.d.ts",
+  "version": "1.0.0",
+  "description": "H.264 hardware decoder module for WinRemote"
+}

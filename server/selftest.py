@@ -137,6 +137,72 @@ async def streaming() -> None:
               json.dumps(stopped))
 
 
+async def h264_streaming() -> None:
+    from websockets.asyncio.client import connect
+
+    async with connect("ws://127.0.0.1:%d" % PORT, open_timeout=5) as ws:
+        await asyncio.wait_for(ws.recv(), 5)                      # needToken announcement
+        await ws.send(json.dumps({"t": "hello", "token": TOKEN}))
+        await asyncio.wait_for(ws.recv(), 5)                      # hello ok
+
+        await ws.send(json.dumps({
+            "t": "stream", "on": True, "fps": 6, "maxWidth": 640, "quality": 50,
+            "codec": "h264", "ack": False,
+        }))
+        state: Dict[str, Any] = json.loads(await asyncio.wait_for(ws.recv(), 10))
+        check("h264 stream start acknowledged",
+              state.get("t") == "streamState" and state.get("on") is True,
+              "codec=%s backend=%s" % (state.get("codec"), state.get("backend")))
+        check("h264 codec honoured", state.get("codec") == "h264")
+
+        frames = 0
+        annexb_ok = True
+        saw_sps = False
+        saw_idr = False
+        deadline = time.time() + 30
+        while frames < 8 and time.time() < deadline:
+            message = await asyncio.wait_for(ws.recv(), 30)
+            if isinstance(message, (bytes, bytearray)):
+                data = bytes(message)
+                frames += 1
+                if data[:4] != b"\x00\x00\x00\x01" and data[:3] != b"\x00\x00\x01":
+                    annexb_ok = False
+                # find first start code and inspect NAL types in the access unit
+                pos = 0
+                while True:
+                    idx3 = data.find(b"\x00\x00\x01", pos)
+                    if idx3 < 0:
+                        break
+                    nal_start = idx3 + 3
+                    if data[nal_start - 1] == 0:  # was a 4-byte code
+                        pass
+                    if nal_start < len(data):
+                        nal_type = data[nal_start] & 0x1F
+                        if nal_type == 7:
+                            saw_sps = True
+                        if nal_type == 5:
+                            saw_idr = True
+                    pos = nal_start + 1
+        check("received h264 access units", frames >= 5, "%d units" % frames)
+        check("h264 units are Annex B", annexb_ok)
+        check("h264 stream contains SPS", saw_sps)
+        check("h264 stream contains IDR", saw_idr)
+
+        await ws.send(json.dumps({"t": "stream", "on": False}))
+        stopped: Optional[Dict[str, Any]] = None
+        deadline = time.time() + 10
+        while time.time() < deadline:
+            message = await asyncio.wait_for(ws.recv(), 10)
+            if isinstance(message, str):
+                parsed: Dict[str, Any] = json.loads(message)
+                if parsed.get("t") == "streamState":
+                    stopped = parsed
+                    break
+        check("h264 stream stop acknowledged",
+              stopped is not None and stopped.get("on") is False,
+              json.dumps(stopped))
+
+
 def key_resolution() -> None:
     for name in ["enter", "tab", "esc", "f4", "backspace", "space", "a", "5", "win", "ctrl"]:
         try:
@@ -174,6 +240,7 @@ def main() -> int:
         asyncio.run(roundtrip())
         asyncio.run(bad_token())
         asyncio.run(streaming())
+        asyncio.run(h264_streaming())
     except Exception as exc:
         check("unexpected exception", False, "%s: %s" % (type(exc).__name__, exc))
     print("-" * 52)

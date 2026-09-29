@@ -3,6 +3,7 @@ import { BusinessError } from '@kit.BasicServicesKit';
 import { hilog } from '@kit.PerformanceAnalysisKit';
 import { RemoteCmd } from '../model/RemoteProtocol';
 import { RemoteClient } from '../service/RemoteClient';
+import h264 from 'libh264decoder.so';
 
 const DOMAIN: number = 0x0000;
 const TAG: string = 'WinRemote';
@@ -39,11 +40,14 @@ export struct ControlPanel {
   @Prop infoText: string = '';
   @Prop isWide: boolean = false;
   @Prop screenRatio: number = 1.7777778;
+  @Prop @Watch('onScreenDims') screenW: number = 0;
+  @Prop screenH: number = 0;
   onDisconnect: () => void = () => {
   };
   onSend: (data: string) => void = () => {
   };
 
+  @State codec: string = 'jpeg';
   client: RemoteClient | undefined = undefined;
 
   @State frame: image.PixelMap | undefined = undefined;
@@ -51,6 +55,8 @@ export struct ControlPanel {
   @State showPanel: boolean = false;
   @State padW: number = 1;
   @State padH: number = 1;
+  @State videoW: number = 1;
+  @State videoH: number = 1;
   @State draft: string = '';
   @State streamFps: number = 20;
   @State streamQuality: number = 70;
@@ -81,6 +87,9 @@ export struct ControlPanel {
   private scrollLastY: number = 0;
   private scrollStep: number = 40;
   private scrollAcc: number = 0;
+  private xcomponentController: XComponentController = new XComponentController();
+  private surfaceReady: boolean = false;
+  private h264Started: boolean = false;
 
   private keys: KeyButton[] = [
     new KeyButton('Enter', 'key', 'enter'),
@@ -113,7 +122,11 @@ export struct ControlPanel {
       target.onFrame = (data: ArrayBuffer) => {
         this.handleFrame(data);
       };
-      this.applyStream(true);
+      if (this.codec !== 'h264') {
+        this.applyStream(true);
+      } else {
+        this.tryStartH264();
+      }
     }
   }
 
@@ -122,7 +135,12 @@ export struct ControlPanel {
     if (target !== undefined) {
       target.onFrame = (data: ArrayBuffer) => {
       };
-      target.setStreaming(false, this.streamFps, this.streamQuality, this.streamMaxWidth);
+      target.setStreaming(false, this.streamFps, this.streamQuality, this.streamMaxWidth, this.codec);
+    }
+    if (this.codec === 'h264') {
+      h264.releaseDecoder();
+      this.surfaceReady = false;
+      this.h264Started = false;
     }
     const current: image.PixelMap | undefined = this.frame;
     if (current !== undefined) {
@@ -131,10 +149,62 @@ export struct ControlPanel {
     }
   }
 
+  private onScreenDims(): void {
+    this.updateVideoSize();
+    if (this.codec === 'h264') {
+      this.tryStartH264();
+    }
+  }
+
+  private onSurfaceReady(): void {
+    this.surfaceReady = true;
+    hilog.info(DOMAIN, TAG, 'xcomponent surface ready');
+    if (this.codec === 'h264') {
+      this.tryStartH264();
+    }
+  }
+
+  private onRendered(): void {
+    const target: RemoteClient | undefined = this.client;
+    if (target !== undefined) {
+      target.ack();
+    }
+  }
+
+  private tryStartH264(): void {
+    if (this.h264Started || !this.surfaceReady || this.screenW <= 0 || this.screenH <= 0) {
+      return;
+    }
+    let targetW: number = this.screenW;
+    let targetH: number = this.screenH;
+    if (this.streamMaxWidth > 0 && targetW > this.streamMaxWidth) {
+      targetH = Math.max(1, Math.floor(targetH * this.streamMaxWidth / targetW));
+      targetW = this.streamMaxWidth;
+    }
+    let ok: boolean = false;
+    try {
+      h264.setRenderCallback(() => {
+        this.onRendered();
+      });
+      const surfaceId: string = this.xcomponentController.getXComponentSurfaceId();
+      ok = h264.createDecoder(surfaceId, targetW, targetH);
+    } catch (error) {
+      hilog.error(DOMAIN, TAG, 'createDecoder threw');
+    }
+    if (!ok) {
+      hilog.error(DOMAIN, TAG, 'native decoder unavailable, falling back to jpeg');
+      this.codec = 'jpeg';
+      this.applyStream(true);
+      return;
+    }
+    this.h264Started = true;
+    this.applyStream(true);
+  }
+
   private applyStream(on: boolean): void {
     const target: RemoteClient | undefined = this.client;
     if (target !== undefined) {
-      target.setStreaming(on, this.streamFps, this.streamQuality, this.streamMaxWidth);
+      target.setStreaming(on, this.streamFps, this.streamQuality, this.streamMaxWidth, this.codec);
     }
   }
 
@@ -161,6 +231,27 @@ export struct ControlPanel {
     this.lastArriveAt = now;
     this.statsRecv++;
     this.statsBytes += data.byteLength;
+    if (this.codec === 'h264') {
+      const started: number = Date.now();
+      let pushed: boolean = false;
+      try {
+        pushed = h264.pushFrame(data);
+      } catch (error) {
+        pushed = false;
+      }
+      if (!pushed) {
+        this.statsDropped++;
+        return;
+      }
+      const cost: number = Date.now() - started;
+      this.statsFrames++;
+      this.statsDecodeTotal += cost;
+      if (cost > this.statsDecodeMax) {
+        this.statsDecodeMax = cost;
+      }
+      this.reportStats();
+      return;
+    }
     if (this.decoding) {
       this.statsDropped++;
     }
@@ -248,6 +339,19 @@ export struct ControlPanel {
         current.release();
         this.frame = undefined;
       }
+    }
+  }
+
+  private updateVideoSize(): void {
+    const cw: number = this.padW > 1 ? this.padW : 1;
+    const ch: number = this.padH > 1 ? this.padH : 1;
+    const containerRatio: number = cw / ch;
+    if (this.screenRatio > containerRatio) {
+      this.videoW = cw;
+      this.videoH = cw / this.screenRatio;
+    } else {
+      this.videoH = ch;
+      this.videoW = ch * this.screenRatio;
     }
   }
 
@@ -488,7 +592,14 @@ export struct ControlPanel {
   @Builder
   screenArea() {
     Stack({ alignContent: Alignment.Center }) {
-      if (this.frame !== undefined) {
+      if (this.codec === 'h264') {
+        XComponent({ id: 'winremoteVideo', type: XComponentType.SURFACE, controller: this.xcomponentController })
+          .width(this.videoW)
+          .height(this.videoH)
+          .onLoad(() => {
+            this.onSurfaceReady();
+          })
+      } else if (this.frame !== undefined) {
         Image(this.frame)
           .width('100%')
           .height('100%')
@@ -519,6 +630,7 @@ export struct ControlPanel {
       if (typeof newArea.height === 'number') {
         this.padH = newArea.height;
       }
+      this.updateVideoSize();
     })
     .onTouch((event: TouchEvent) => {
       this.handleScreenTouch(event);
@@ -687,7 +799,9 @@ export struct ControlPanel {
       .width('100%')
       .alignItems(VerticalAlign.Center)
 
-      Text('抓屏是瓶颈（本机约 40~70ms/帧），实测上限约 10~15fps')
+      Text(this.codec === 'h264'
+        ? 'H.264 硬编码：带宽约为 JPEG 的 1/5，静止画面码率极低，支持 2K 高帧率'
+        : 'JPEG 模式：抓屏是瓶颈（本机约 40~70ms/帧），实测上限约 10~15fps')
         .fontSize(10)
         .fontColor('#48536E')
         .width('100%')

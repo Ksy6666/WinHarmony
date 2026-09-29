@@ -519,6 +519,171 @@ async def grab_jpeg(max_width: int, quality: int) -> tuple:
 
 
 # --------------------------------------------------------------------------- #
+# H.264 encoding (PyAV): hardware first (Media Foundation / NVENC), then x264
+# --------------------------------------------------------------------------- #
+
+H264_ENCODER_CANDIDATES = ("h264_mf", "h264_nvenc", "libx264")
+H264_SUPPORTED = False
+try:
+    import av  # noqa: F401
+    for _name in H264_ENCODER_CANDIDATES:
+        try:
+            av.codec.Codec(_name, "w")
+            H264_SUPPORTED = True
+            break
+        except Exception:
+            continue
+except ImportError:
+    pass
+
+
+def h264_bitrate(quality: int, width: int, height: int, fps: int) -> int:
+    """Map the client's quality knob (10..95) to a bitrate in bits/second."""
+    base = 6_000_000 if quality <= 50 else (10_000_000 if quality <= 70 else 18_000_000)
+    scale = (width * height * max(1, fps)) / (1920.0 * 1080.0 * 30.0)
+    return clamp(int(base * max(0.3, min(scale, 4.0))), 500_000, 80_000_000)
+
+
+def avcc_to_annexb(data: bytes) -> bytes:
+    """Convert AVCC extradata (avcC box) to Annex B start-code format."""
+    if not data or len(data) < 7:
+        return b""
+    if data[:4] == b"\x00\x00\x00\x01" or data[:3] == b"\x00\x00\x01":
+        return bytes(data)
+    out = []
+    try:
+        length_size = (data[4] & 0x03) + 1
+        i = 5
+        num_sps = data[i] & 0x1F
+        i += 1
+        for _ in range(num_sps):
+            n = int.from_bytes(data[i:i + 2], "big")
+            i += 2
+            out.append(b"\x00\x00\x00\x01" + data[i:i + n])
+            i += n
+        num_pps = data[i]
+        i += 1
+        for _ in range(num_pps):
+            n = int.from_bytes(data[i:i + 2], "big")
+            i += 2
+            out.append(b"\x00\x00\x00\x01" + data[i:i + n])
+            i += n
+        return b"".join(out)
+    except Exception:
+        return b""
+
+
+class H264Encoder:
+    """One H.264 encode context per session.
+
+    Lives entirely on the CAPTURE_POOL worker thread. Produces Annex B NAL
+    units (one access unit per encode() call in the low-latency configuration:
+    no B-frames, headers repeated before each IDR where the encoder does so).
+    """
+
+    def __init__(self, width: int, height: int, fps: int, bitrate: int) -> None:
+        import av
+        from fractions import Fraction
+
+        self.params = (width, height, fps, bitrate)
+        self.width = width - (width % 2)
+        self.height = height - (height % 2)
+        self.fps = max(1, min(fps, 60))
+        self.pts = 0
+        self.name = "none"
+        codec = None
+        for name in H264_ENCODER_CANDIDATES:
+            try:
+                codec = av.codec.Codec(name, "w")
+                self.name = name
+                break
+            except Exception:
+                continue
+        if codec is None:
+            raise RuntimeError("no H.264 encoder available")
+
+        ctx = codec.create()
+        ctx.width = self.width
+        ctx.height = self.height
+        ctx.pix_fmt = "yuv420p"
+        ctx.time_base = Fraction(1, self.fps)
+        ctx.framerate = Fraction(self.fps, 1)
+        ctx.bit_rate = bitrate
+        ctx.gop_size = max(1, self.fps)
+        if self.name == "libx264":
+            ctx.options = {"preset": "ultrafast", "tune": "zerolatency"}
+        elif self.name == "h264_mf":
+            ctx.options = {"rate_control": "cbr"}
+        ctx.open()
+        self.ctx = ctx
+        self.header = avcc_to_annexb(bytes(ctx.extradata or b""))
+        self.header_sent = False
+        log.info("H264 encoder started: %s %dx%d fps=%d bitrate=%d",
+                 self.name, self.width, self.height, self.fps, bitrate)
+
+    def encode(self, image) -> bytes:
+        """Encode one RGB PIL image; returns one Annex B access unit (may be empty)."""
+        import av
+        import numpy as np
+
+        if image.width != self.width or image.height != self.height:
+            image = image.resize((self.width, self.height))
+        array = np.asarray(image)
+        frame = av.VideoFrame.from_ndarray(array, format="rgb24")
+        frame = frame.reformat(format="yuv420p")
+        frame.pts = self.pts
+        self.pts += 1
+        chunks = []
+        for packet in self.ctx.encode(frame):
+            chunks.append(bytes(packet))
+        if not chunks:
+            return b""
+        payload = b"".join(chunks)
+        if not self.header_sent:
+            if self.header:
+                payload = self.header + payload
+            self.header_sent = True
+        return payload
+
+    def close(self) -> None:
+        try:
+            self.ctx.close()
+        except Exception:
+            pass
+
+
+def scale_image(image, max_width: int):
+    """Shared downscale path for JPEG and H.264 (see encode_jpeg notes)."""
+    if max_width and image.width > max_width:
+        factor = image.width // max_width
+        if factor >= 2 and abs(image.width / factor - max_width) <= 2:
+            return image.reduce(factor)
+        ratio = max_width / float(image.width)
+        return image.resize((max_width, max(1, int(image.height * ratio))), PILImage.BOX)
+    return image
+
+
+def capture_h264_blocking(session: "Session") -> tuple:
+    """Grab the screen and H.264 encode it, on the dedicated worker thread."""
+    image = CAPTURER.grab()
+    image = scale_image(image, session.max_width)
+    bitrate = h264_bitrate(session.quality, image.width, image.height, session.fps)
+    params = (image.width, image.height, session.fps, bitrate)
+    if session.h264_encoder is None or session.h264_encoder.params != params:
+        old = session.h264_encoder
+        session.h264_encoder = H264Encoder(image.width, image.height, session.fps, bitrate)
+        if old is not None:
+            old.close()
+    payload = session.h264_encoder.encode(image)
+    return payload, image.width, image.height
+
+
+async def grab_h264(session: "Session") -> tuple:
+    loop = asyncio.get_running_loop()
+    return await loop.run_in_executor(CAPTURE_POOL, capture_h264_blocking, session)
+
+
+# --------------------------------------------------------------------------- #
 # transport
 # --------------------------------------------------------------------------- #
 
@@ -538,6 +703,7 @@ class Session:
         self.ws = websocket
         self.authed = False
         self.streaming = False
+        self.codec = "jpeg"
         self.fps = DEFAULT_FPS
         self.quality = DEFAULT_QUALITY
         self.max_width = DEFAULT_MAX_WIDTH
@@ -546,6 +712,7 @@ class Session:
         self.ack_cond = asyncio.Condition()
         self.send_lock = asyncio.Lock()
         self.task: Optional[asyncio.Task] = None
+        self.h264_encoder: Optional[H264Encoder] = None
         addr = getattr(websocket, "remote_address", None)
         self.peer = "%s:%s" % (addr[0], addr[1]) if addr else "unknown"
 
@@ -601,18 +768,21 @@ async def stream_loop(session: Session) -> None:
     overlaps with the client's own decode time instead of being serialised after
     it.
     """
-    log.info("stream started for %s (%s fps, %s px, q%d, ack=%s)",
+    log.info("stream started for %s (%s fps, %s px, q%d, ack=%s, codec=%s)",
              session.peer, session.fps,
              "native" if not session.max_width else session.max_width,
-             session.quality, session.ack_mode)
+             session.quality, session.ack_mode, session.codec)
     try:
         sent = 0
         ack_base = session.acks
         while session.streaming:
             started = time.monotonic()
-            capture = asyncio.ensure_future(
-                grab_jpeg(session.max_width, session.quality)
-            )
+            if session.codec == "h264":
+                capture = asyncio.ensure_future(grab_h264(session))
+            else:
+                capture = asyncio.ensure_future(
+                    grab_jpeg(session.max_width, session.quality)
+                )
 
             if session.ack_mode and sent > 0:
                 if not await wait_ack_after(session, ack_base, ACK_TIMEOUT):
@@ -629,6 +799,11 @@ async def stream_loop(session: Session) -> None:
 
             if not session.streaming:
                 break
+
+            if not frame:
+                # Encoders occasionally emit nothing for an input frame
+                # (pipeline warm-up); just grab the next one.
+                continue
 
             try:
                 await send_frame(session, frame)
@@ -651,6 +826,10 @@ def stop_stream(session: Session) -> None:
     if task is not None and not task.done():
         task.cancel()
     session.task = None
+    if session.h264_encoder is not None:
+        encoder = session.h264_encoder
+        session.h264_encoder = None
+        CAPTURE_POOL.submit(encoder.close)
 
 
 def start_stream(session: Session) -> None:
@@ -732,13 +911,23 @@ async def handle_client(websocket: Any, path: Any = None) -> None:
                     width = int(cmd.get("maxWidth", DEFAULT_MAX_WIDTH))
                     session.max_width = 0 if width <= 0 else clamp(width, 320, 3840)
                     session.ack_mode = bool(cmd.get("ack", False))
+                    wanted_codec = str(cmd.get("codec", "jpeg")).strip().lower()
+                    if wanted_codec == "h264" and not H264_SUPPORTED:
+                        log.warning("client asked for h264 but PyAV/encoder is missing; using jpeg")
+                        wanted_codec = "jpeg"
+                    if wanted_codec not in ("jpeg", "h264"):
+                        wanted_codec = "jpeg"
+                    if session.codec != wanted_codec and session.h264_encoder is not None:
+                        session.h264_encoder.close()
+                        session.h264_encoder = None
+                    session.codec = wanted_codec
                     start_stream(session)
                 else:
                     stop_stream(session)
-                log.info("stream params for %s: %s fps, %s px, q%d, ack=%s, on=%s",
+                log.info("stream params for %s: %s fps, %s px, q%d, ack=%s, on=%s, codec=%s",
                          session.peer, session.fps,
                          "native" if not session.max_width else session.max_width,
-                         session.quality, session.ack_mode, session.streaming)
+                         session.quality, session.ack_mode, session.streaming, session.codec)
                 await send_json(session, {
                     "t": "streamState",
                     "on": session.streaming,
@@ -748,9 +937,18 @@ async def handle_client(websocket: Any, path: Any = None) -> None:
                     "ackMode": session.ack_mode,
                     "screenW": screen[0],
                     "screenH": screen[1],
+                    "codec": session.codec,
                     "backend": CAPTURER.backend,
                 })
                 continue
+
+            if kind in ("move", "moveto"):
+                # high-frequency commands: log at most 1 of every 50
+                session._move_log = getattr(session, "_move_log", 0) + 1
+                if session._move_log % 50 == 1:
+                    log.info("input %s from %s (1/%d logged)", kind, session.peer, session._move_log)
+            elif kind in ("click", "scroll", "key", "combo", "text"):
+                log.info("input %s from %s: %s", kind, session.peer, raw[:120])
 
             try:
                 reply = dispatch(cmd)
@@ -845,10 +1043,66 @@ async def run(host: str, port: int) -> None:
     print_banner(port)
 
     async with ws_serve(handle_client, host, port, max_size=2 ** 22):
+        if getattr(sys, "frozen", False):
+            asyncio.ensure_future(parent_watchdog())
         await asyncio.Future()
 
 
 TOKEN: Optional[str] = None
+
+
+async def parent_watchdog() -> None:
+    """Frozen-exe safety net: exit as soon as the bootloader parent is gone.
+
+    PyInstaller onefile runs as parent bootloader + child app process.
+    When the console window is closed, the bootloader dies but the child
+    can survive holding the port - exactly the "closed but still running"
+    zombie users see. Poll the parent handle; if it exits, self-terminate.
+    """
+    ppid = os.getppid()
+    if not ppid:
+        return
+    import ctypes
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    SYNCHRONIZE = 0x00100000
+    WAIT_OBJECT_0 = 0
+    while True:
+        handle = kernel32.OpenProcess(SYNCHRONIZE, False, ppid)
+        if not handle:
+            break
+        try:
+            if kernel32.WaitForSingleObject(handle, 0) == WAIT_OBJECT_0:
+                break
+        finally:
+            kernel32.CloseHandle(handle)
+        await asyncio.sleep(3)
+    print("\nConsole closed - exiting.")
+    sys.stdout.flush()
+    os._exit(0)
+
+
+def install_exit_handler() -> None:
+    """Force-kill the process the moment the console window is closed.
+
+    The WGC capture thread and executor threads are non-daemon; Python's
+    graceful shutdown would block on them, leaving a zombie process after
+    the user clicks the X button. os._exit() terminates instantly.
+    """
+    if sys.platform != "win32":
+        return
+    import ctypes
+    from ctypes import wintypes
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    handler = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.DWORD)
+
+    @handler
+    def on_console_event(event: int) -> bool:
+        os._exit(0)
+        return True
+
+    kernel32.SetConsoleCtrlHandler(on_console_event, True)
 
 
 def main() -> None:
@@ -865,11 +1119,13 @@ def main() -> None:
         logging.getLogger().setLevel(logging.WARNING)
 
     TOKEN = args.token.strip() or None
+    install_exit_handler()
 
     try:
         asyncio.run(run(args.host, args.port))
     except KeyboardInterrupt:
         print("\nstopped")
+        os._exit(0)
     except OSError as exc:
         fatal("Cannot listen on port %d: %s\nIs another WinRemote already running?" % (args.port, exc))
 

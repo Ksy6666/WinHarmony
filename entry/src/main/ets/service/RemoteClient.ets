@@ -114,10 +114,13 @@ export class RemoteClient {
     this.setState(ConnState.Idle, '未连接');
   }
 
-  send(data: string): boolean {    const socket: webSocket.WebSocket | undefined = this.socket;
+  send(data: string): boolean {
+    const socket: webSocket.WebSocket | undefined = this.socket;
     if (socket === undefined) {
+      hilog.warn(DOMAIN, TAG, 'send skipped (not connected): %{public}s', data);
       return false;
     }
+    hilog.debug(DOMAIN, TAG, 'CMD -> %{public}s', data);
     try {
       socket.send(data).then((value: boolean) => {
       }).catch((err: BusinessError) => {
@@ -125,13 +128,13 @@ export class RemoteClient {
       });
       return true;
     } catch (error) {
-      hilog.warn(DOMAIN, TAG, 'send threw');
+      hilog.warn(DOMAIN, TAG, 'send threw: %{public}s', data);
       return false;
     }
   }
 
-  setStreaming(on: boolean, fps: number, quality: number, maxWidth: number): boolean {
-    return this.send(RemoteCmd.stream(on, fps, quality, maxWidth));
+  setStreaming(on: boolean, fps: number, quality: number, maxWidth: number, codec: string): boolean {
+    return this.send(RemoteCmd.stream(on, fps, quality, maxWidth, codec));
   }
 
   ack(): void {

@@ -5,6 +5,8 @@
   "main": "",
   "author": "",
   "license": "",
-  "dependencies": {}
+  "dependencies": {
+    "libh264decoder.so": "file:./src/main/cpp/types/libh264decoder"
+  }
 }
 

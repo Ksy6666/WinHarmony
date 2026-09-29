@@ -25,6 +25,7 @@ export interface ServerMessage {
   ackMode?: boolean;
   screenW?: number;
   screenH?: number;
+  codec?: string;
   backend?: string;
 }
 
@@ -35,6 +36,7 @@ class StreamPayload {
   quality: number = 55;
   maxWidth: number = 1024;
   ack: boolean = true;
+  codec: string = 'jpeg';
 }
 
 class HelloPayload {
@@ -108,12 +110,13 @@ export class RemoteCmd {
     return '{"t":"sysinfo"}';
   }
 
-  static stream(on: boolean, fps: number, quality: number, maxWidth: number): string {
+  static stream(on: boolean, fps: number, quality: number, maxWidth: number, codec: string): string {
     const payload: StreamPayload = new StreamPayload();
     payload.on = on;
     payload.fps = fps;
     payload.quality = quality;
     payload.maxWidth = maxWidth;
+    payload.codec = codec;
     return JSON.stringify(payload);
   }
 

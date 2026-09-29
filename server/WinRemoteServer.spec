@@ -1,14 +1,17 @@
 # -*- mode: python ; coding: utf-8 -*-
-from PyInstaller.utils.hooks import collect_submodules
+from PyInstaller.utils.hooks import collect_submodules, collect_dynamic_libs
 
 hiddenimports = ['pynput.keyboard._win32', 'pynput.mouse._win32', 'mss.windows']
 hiddenimports += collect_submodules('mss')
+
+# PyAV: bundle the extension module plus bundled FFmpeg DLLs
+av_binaries = collect_dynamic_libs('av')
 
 
 a = Analysis(
     ['winremote_server.py'],
     pathex=[],
-    binaries=[],
+    binaries=av_binaries,
     datas=[],
     hiddenimports=hiddenimports,
     hookspath=[],
